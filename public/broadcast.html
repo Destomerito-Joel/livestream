@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d10">
+  <title>Broadcast — LiveCover</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body class="broadcast-page">
+<main class="wrap broadcast-wrap">
+  <header class="broadcast-header">
+    <a class="brand" href="/" aria-label="LiveCover home"><span class="brand-mark" aria-hidden="true">L</span>LiveCover</a>
+    <div class="header-status">
+      <span class="connection-status" id="connection" role="status">Connecting…</span>
+      <span class="pill" id="pill" aria-live="polite">OFFLINE</span>
+    </div>
+  </header>
+
+  <section class="broadcast-intro" aria-labelledby="title">
+    <div>
+      <p class="eyebrow">BROADCAST STUDIO</p>
+      <h1 id="title">Loading your room…</h1>
+      <p class="muted">Choose a camera or share your screen, then go live for your viewers.</p>
+    </div>
+  </section>
+
+  <section class="studio-card" aria-label="Broadcast preview and controls">
+    <div class="stage broadcast-stage">
+      <video id="preview" autoplay muted playsinline aria-label="Your broadcast preview"></video>
+      <div class="overlay" id="ov">Choose a source to preview your broadcast</div>
+      <span class="preview-badge"><span class="preview-dot" aria-hidden="true"></span> PREVIEW</span>
+    </div>
+
+    <div class="studio-controls">
+      <div>
+        <p class="control-heading">Your source</p>
+        <p class="muted control-hint">Your preview is private until you go live.</p>
+      </div>
+      <div class="control-actions">
+        <button id="cam" type="button" aria-pressed="false">
+          <span aria-hidden="true">◉</span> Camera
+        </button>
+        <button id="scr" type="button" aria-pressed="false">
+          <span aria-hidden="true">▣</span> Share screen
+        </button>
+        <button id="go" class="primary go-live" type="button" disabled>Go live</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="broadcast-bottom" aria-label="Broadcast details">
+    <div class="viewer-card">
+      <span class="viewer-icon" aria-hidden="true">◎</span>
+      <div><span class="muted">Viewers watching</span><strong id="count">0</strong></div>
+    </div>
+
+    <div class="share-card">
+      <div>
+        <h2>Share your stream</h2>
+        <p class="muted">Anyone with this link can watch.</p>
+      </div>
+      <label for="link">Viewer link</label>
+      <div class="share-row">
+        <input id="link" readonly aria-label="Viewer link">
+        <button id="copy" type="button">Copy link</button>
+      </div>
+    </div>
+  </section>
+  <p class="err broadcast-error" id="err" role="status" aria-live="polite"></p>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const roomMatch = location.pathname.match(/^\/b\/([a-f0-9]+)\/?$/i);
+const roomId = roomMatch ? roomMatch[1] : '';
+const token = new URLSearchParams(location.search).get('t') || '';
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+let stream = null;
+let live = false;
+let ws = null;
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+let viewers = new Set();
+let queue = Promise.resolve();
+const peers = new Map();
+
+$('link').value = roomId ? `${location.origin}/w/${roomId}` : '';
+
+function showError(message) {
+  $('err').textContent = message || '';
+}
+
+function setConnection(message) {
+  $('connection').textContent = message;
+}
+
+function send(message) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
+}
+
+function setLive(on, announce = true) {
+  if (on && (!stream || !stream.getVideoTracks().some((track) => track.readyState === 'live'))) {
+    showError('Choose an active camera or screen before going live.');
+    return;
+  }
+  live = on;
+  $('pill').textContent = on ? 'LIVE' : 'OFFLINE';
+  $('pill').classList.toggle('on', on);
+  $('go').textContent = on ? 'Stop broadcast' : 'Go live';
+  $('go').classList.toggle('is-live', on);
+  if (announce) send({ type: 'live', on });
+  if (on) viewers.forEach((viewerId) => connect(viewerId));
+  else [...peers.keys()].forEach(drop);
+}
+
+function drop(viewerId) {
+  const pc = peers.get(viewerId);
+  if (!pc) return;
+  peers.delete(viewerId);
+  pc.close();
+}
+
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      pc.removeEventListener('icegatheringstatechange', checkState);
+      resolve();
+    };
+    const checkState = () => {
+      if (pc.iceGatheringState === 'complete') finish();
+    };
+    const timer = setTimeout(finish, 8000);
+    pc.addEventListener('icegatheringstatechange', checkState);
+    checkState();
+  });
+}
+
+async function connect(viewerId) {
+  if (!stream || !live || !viewers.has(viewerId)) return;
+  drop(viewerId);
+  const pc = new RTCPeerConnection(ICE);
+  peers.set(viewerId, pc);
+  stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+  const videoSender = pc.getSenders().find((sender) => sender.track && sender.track.kind === 'video');
+  if (videoSender) {
+    const parameters = videoSender.getParameters();
+    if (!parameters.encodings || !parameters.encodings.length) parameters.encodings = [{}];
+    parameters.encodings[0].maxBitrate = 1_500_000;
+    try {
+      await videoSender.setParameters(parameters);
+    } catch (error) {
+      if (peers.get(viewerId) === pc) showError(`Could not apply the preferred video bitrate: ${error.message}`);
+    }
+  }
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'failed' && peers.get(viewerId) === pc) {
+      drop(viewerId);
+      showError('A viewer connection failed. They can reconnect by refreshing their page.');
+    }
+  };
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await waitForIceGathering(pc);
+    if (peers.get(viewerId) === pc && viewers.has(viewerId) && live) {
+      send({ type: 'signal', to: viewerId, data: { sdp: pc.localDescription } });
+    }
+  } catch (error) {
+    if (peers.get(viewerId) === pc) {
+      drop(viewerId);
+      showError(`Could not connect to a viewer: ${error.message}`);
+    }
+  }
+}
+
+async function onSignal(viewerId, data) {
+  const pc = peers.get(viewerId);
+  if (!pc) return;
+  try {
+    if (data.sdp) await pc.setRemoteDescription(data.sdp);
+    else if (data.candidate) await pc.addIceCandidate(data.candidate);
+  } catch (error) {
+    if (peers.get(viewerId) === pc) {
+      drop(viewerId);
+      showError(`Could not complete a viewer connection: ${error.message}`);
+    }
+  }
+}
+
+function openWs() {
+  if (!roomId || !token || document.visibilityState === 'hidden') return;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const socket = new WebSocket(`${proto}//${location.host}/ws?room=${encodeURIComponent(roomId)}&role=host&token=${encodeURIComponent(token)}`);
+  ws = socket;
+  setConnection('Connecting…');
+
+  socket.onopen = () => {
+    if (ws !== socket) return;
+    reconnectDelay = 1000;
+    setConnection('Connected');
+    if (live) send({ type: 'live', on: true });
+  };
+  socket.onmessage = (event) => {
+    if (ws !== socket) return;
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      showError('The server sent an unreadable message. Reconnecting…');
+      socket.close();
+      return;
+    }
+    if (message.type === 'viewers') {
+      viewers = new Set(message.ids);
+      if (live) viewers.forEach((viewerId) => connect(viewerId));
+    } else if (message.type === 'viewer-joined') {
+      viewers.add(message.id);
+      if (live) connect(message.id);
+    } else if (message.type === 'viewer-left') {
+      viewers.delete(message.id);
+      drop(message.id);
+    } else if (message.type === 'status') {
+      $('count').textContent = String(message.count);
+    } else if (message.type === 'signal') {
+      queue = queue.then(() => onSignal(message.from, message.data)).catch((error) => {
+        showError(`A signaling error occurred: ${error.message}`);
+      });
+    }
+  };
+  socket.onclose = (event) => {
+    if (ws !== socket) return;
+    ws = null;
+    if (event.code === 4003) {
+      setConnection('Access denied');
+      showError('This broadcaster link is invalid or has expired.');
+      return;
+    }
+    if (event.code === 4004) {
+      setConnection('Room unavailable');
+      showError('This broadcast room could not be found.');
+      return;
+    }
+    if (event.code === 4009) {
+      setConnection('Disconnected');
+      showError('This broadcast is open in another tab. Close the other tab to continue here.');
+      return;
+    }
+    setConnection('Reconnecting…');
+    [...peers.keys()].forEach(drop);
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      openWs();
+    }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+  };
+  socket.onerror = () => {
+    if (ws === socket) setConnection('Connection interrupted');
+  };
+}
+
+async function pick(kind) {
+  showError('');
+  if (!navigator.mediaDevices) {
+    showError('Camera and screen sharing require a secure connection (HTTPS or localhost).');
+    return;
+  }
+  let nextStream;
+  try {
+    if (kind === 'cam') {
+      const video = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      try {
+        nextStream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
+      } catch (error) {
+        if (error.name !== 'NotAllowedError') throw error;
+        nextStream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+      }
+    } else {
+      nextStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    }
+    if (!nextStream.getVideoTracks().length) throw new Error('The selected source did not provide a video track.');
+  } catch (error) {
+    if (error.name === 'NotAllowedError') showError('Permission was denied. Allow access and try again.');
+    else if (error.name === 'NotFoundError') showError('No compatible camera or screen source was found.');
+    else if (error.name === 'NotReadableError') showError('The camera or screen is already in use by another app.');
+    else showError(`Could not access the selected source: ${error.message}`);
+    return;
+  }
+
+  const previousStream = stream;
+  const previousKinds = previousStream && previousStream.getTracks().map((track) => track.kind).sort().join(',');
+  const nextKinds = nextStream.getTracks().map((track) => track.kind).sort().join(',');
+  stream = nextStream;
+  $('preview').srcObject = stream;
+  $('ov').classList.add('hide');
+  $('go').disabled = false;
+  $('cam').setAttribute('aria-pressed', String(kind === 'cam'));
+  $('scr').setAttribute('aria-pressed', String(kind === 'scr'));
+  stream.getVideoTracks()[0].onended = () => {
+    if (stream !== nextStream) return;
+    stream = null;
+    $('preview').srcObject = null;
+    $('ov').textContent = 'Choose a source to preview your broadcast';
+    $('ov').classList.remove('hide');
+    $('go').disabled = true;
+    $('cam').setAttribute('aria-pressed', 'false');
+    $('scr').setAttribute('aria-pressed', 'false');
+    setLive(false);
+  };
+
+  if (live) {
+    if (previousKinds !== nextKinds) {
+      viewers.forEach((viewerId) => connect(viewerId));
+    } else {
+      const replacements = [];
+      for (const [viewerId, pc] of peers) {
+        for (const sender of pc.getSenders()) {
+          const track = stream.getTracks().find((candidate) => candidate.kind === sender.track?.kind);
+          if (track) replacements.push(sender.replaceTrack(track));
+        }
+      }
+      const results = await Promise.allSettled(replacements);
+      if (results.some((result) => result.status === 'rejected')) {
+        showError('The source changed, but one or more viewer connections need to reconnect.');
+        viewers.forEach((viewerId) => connect(viewerId));
+      }
+    }
+  }
+  if (previousStream) previousStream.getTracks().forEach((track) => track.stop());
+}
+
+async function copyLink() {
+  const button = $('copy');
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText($('link').value);
+    } else {
+      $('link').select();
+      if (!document.execCommand('copy')) throw new Error('Copy is not available in this browser.');
+      $('link').setSelectionRange(0, 0);
+    }
+    button.textContent = 'Copied!';
+    showError('');
+    setTimeout(() => { button.textContent = 'Copy link'; }, 1600);
+  } catch (error) {
+    showError(`Could not copy the viewer link: ${error.message}`);
+  }
+}
+
+async function loadRoom() {
+  if (!roomId) {
+    $('title').textContent = 'Invalid broadcast link';
+    setConnection('Unavailable');
+    showError('This broadcast link is not valid.');
+    return false;
+  }
+  try {
+    const response = await fetch(`/api/rooms/${encodeURIComponent(roomId)}`);
+    if (!response.ok) throw new Error(response.status === 404 ? 'Room not found.' : 'Could not load this room.');
+    const room = await response.json();
+    $('title').textContent = room.title;
+    document.title = `${room.title} — Broadcast`;
+    return true;
+  } catch (error) {
+    $('title').textContent = 'Broadcast unavailable';
+    setConnection('Unavailable');
+    showError(error.message);
+    return false;
+  }
+}
+
+$('cam').addEventListener('click', () => pick('cam'));
+$('scr').addEventListener('click', () => pick('screen'));
+$('go').addEventListener('click', () => {
+  showError('');
+  setLive(!live);
+});
+$('copy').addEventListener('click', copyLink);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && roomId && !ws && !reconnectTimer) openWs();
+});
+window.addEventListener('beforeunload', (event) => {
+  if (live) {
+    event.preventDefault();
+    event.returnValue = '';
+  }
+});
+
+loadRoom().then((loaded) => {
+  if (loaded) {
+    if (!token) {
+      setConnection('Invalid link');
+      showError('The private broadcaster token is missing from this link.');
+    } else openWs();
+  }
+});
+</script>
+</body>
+</html>

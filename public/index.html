@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiveCover</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="wrap">
+  <header><h1>LiveCover</h1><span class="pill">LIVE VIDEO</span></header>
+  <p class="muted">Create a stream, share one link, and anyone can watch live. Go live from your camera or screen, or share an existing video link (YouTube, HLS .m3u8, MP4).</p>
+
+  <form id="form" class="card">
+    <label for="title" style="margin-top:0">Title</label>
+    <div class="row"><input id="title" maxlength="80" placeholder="e.g. Rally coverage, Port Harcourt" required></div>
+    <label for="url">Video link <span class="muted">(optional — leave empty to broadcast from your camera/screen)</span></label>
+    <div class="row"><input id="url" type="url" placeholder="https://youtube.com/watch?v=… or https://…/stream.m3u8"></div>
+    <div class="row"><button class="primary" type="submit">Create stream</button></div>
+    <p class="err" id="err"></p>
+  </form>
+
+  <div id="result" class="card" hidden>
+    <label style="margin-top:0">Viewer link — share this</label>
+    <div class="row"><input id="watch" readonly><button id="copy" type="button">Copy</button></div>
+    <div id="hostBox" hidden>
+      <label>Broadcaster link — keep private</label>
+      <div class="row"><a id="host" class="primary" style="text-decoration:none"><button class="primary" type="button">Open broadcast page</button></a></div>
+    </div>
+    <div class="row"><a id="open" href="#"><button type="button">Open viewer page</button></a></div>
+  </div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+$('form').onsubmit = async (e) => {
+  e.preventDefault();
+  $('err').textContent = '';
+  try {
+    const r = await fetch('/api/rooms', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ title: $('title').value, url: $('url').value }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Failed');
+    $('watch').value = location.origin + d.watchPath;
+    $('open').href = d.watchPath;
+    $('hostBox').hidden = !d.hostPath;
+    if (d.hostPath) $('host').href = d.hostPath;
+    $('result').hidden = false;
+  } catch (ex) {
+    $('err').textContent = ex.message;
+  }
+};
+$('copy').onclick = async () => {
+  await navigator.clipboard.writeText($('watch').value);
+  $('copy').textContent = 'Copied';
+  setTimeout(() => ($('copy').textContent = 'Copy'), 1500);
+};
+</script>
+</body>
+</html>

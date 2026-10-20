@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Watch — LiveCover</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main class="wrap">
+  <header><h1 id="title">Loading…</h1><span class="pill" id="pill">OFFLINE</span></header>
+
+  <div class="stage" id="stage">
+    <video id="video" autoplay muted playsinline controls></video>
+    <div class="overlay" id="ov">Connecting…</div>
+  </div>
+
+  <div class="row">
+    <button id="mute">Unmute</button>
+    <button id="fs">Fullscreen</button>
+    <span class="muted" style="align-self:center">Watching: <b id="count">0</b></span>
+  </div>
+</main>
+<script>
+const id = location.pathname.split('/')[2];
+const $ = (x) => document.getElementById(x);
+const video = $('video');
+const ICE = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+let info = null, pc = null, ws = null, queue = Promise.resolve();
+
+const overlay = (msg) => { $('ov').textContent = msg || ''; $('ov').classList.toggle('hide', !msg); };
+const setPill = (on) => { $('pill').textContent = on ? 'LIVE' : 'OFFLINE'; $('pill').classList.toggle('on', on); };
+const send = (m) => ws && ws.readyState === 1 && ws.send(JSON.stringify(m));
+
+function ytId(u) {
+  try {
+    const x = new URL(u);
+    if (x.hostname === 'youtu.be') return x.pathname.slice(1);
+    if (/(^|\.)youtube\.com$/.test(x.hostname)) {
+      if (x.searchParams.get('v')) return x.searchParams.get('v');
+      const m = x.pathname.match(/^\/(?:live|shorts|embed)\/([\w-]+)/);
+      if (m) return m[1];
+    }
+  } catch {}
+  return null;
+}
+
+function playUrl(u) {
+  const yt = ytId(u);
+  if (yt) {
+    video.remove();
+    const f = document.createElement('iframe');
+    f.src = `https://www.youtube.com/embed/${encodeURIComponent(yt)}?autoplay=1&mute=1`;
+    f.allow = 'autoplay; fullscreen; picture-in-picture';
+    f.allowFullscreen = true;
+    $('stage').prepend(f);
+    $('mute').style.display = 'none';
+  } else if (/\.m3u8(\?|$)/i.test(u) && !video.canPlayType('application/vnd.apple.mpegurl')) {
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/hls.js@1';
+    s.onload = () => {
+      const h = new Hls({ lowLatencyMode: true });
+      h.loadSource(u);
+      h.attachMedia(video);
+      h.on(Hls.Events.ERROR, (_, d) => d.fatal && overlay('Stream unavailable'));
+    };
+    document.head.appendChild(s);
+  } else {
+    video.src = u;
+    video.onerror = () => overlay('Could not play this video link');
+  }
+  overlay('');
+  setPill(true);
+}
+
+function closePc() {
+  if (pc) { pc.close(); pc = null; }
+  video.srcObject = null;
+}
+
+async function onSignal(data) {
+  if (data.sdp) {
+    closePc();
+    pc = new RTCPeerConnection(ICE);
+    const mine = pc;
+    pc.ontrack = (e) => { video.srcObject = e.streams[0]; overlay(''); video.play().catch(() => {}); };
+    pc.onicecandidate = (e) => e.candidate && send({ type: 'signal', data: { candidate: e.candidate } });
+    pc.onconnectionstatechange = () => {
+      if (mine === pc && ['failed', 'disconnected'].includes(pc.connectionState)) overlay('Reconnecting…');
+    };
+    await pc.setRemoteDescription(data.sdp);
+    await pc.setLocalDescription(await pc.createAnswer());
+    send({ type: 'signal', data: { sdp: pc.localDescription } });
+  } else if (data.candidate && pc) {
+    await pc.addIceCandidate(data.candidate).catch(() => {});
+  }
+}
+
+function openWs() {
+  const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+  ws = new WebSocket(`${proto}${location.host}/ws?room=${id}&role=viewer`);
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'status') {
+      $('count').textContent = m.count;
+      if (info.mode === 'webrtc') {
+        setPill(m.live);
+        if (!m.live) { closePc(); overlay('Waiting for the broadcaster to go live…'); }
+        else if (!pc) overlay('Connecting to stream…');
+      }
+    } else if (m.type === 'signal' && info.mode === 'webrtc') {
+      queue = queue.then(() => onSignal(m.data)).catch(console.warn);
+    }
+  };
+  ws.onclose = (ev) => { if (ev.code !== 4004) setTimeout(openWs, 2000); };
+}
+
+$('mute').onclick = () => { video.muted = !video.muted; $('mute').textContent = video.muted ? 'Unmute' : 'Mute'; };
+$('fs').onclick = () => $('stage').requestFullscreen && $('stage').requestFullscreen();
+
+(async () => {
+  const r = await fetch('/api/rooms/' + id);
+  if (!r.ok) { $('title').textContent = 'Stream not found'; return overlay('This stream does not exist.'); }
+  info = await r.json();
+  $('title').textContent = info.title;
+  document.title = info.title + ' — LiveCover';
+  if (info.mode === 'url') playUrl(info.url);
+  else overlay('Connecting…');
+  openWs();
+})();
+</script>
+</body>
+</html>
